@@ -1,18 +1,24 @@
-// The engines read from their HTML pages. Selectors follow ddgs (https://github.com/deedy5/ddgs,
-// MIT) where it has the engine, checked against pages saved in test/fixtures.
-import { htmlEngine } from "./html.ts";
+// The web engines read from their results pages. Selectors follow ddgs
+// (https://github.com/deedy5/ddgs, MIT) where it has the engine, checked against pages saved in
+// test/fixtures. The safe-search parameters were checked against live results.
+import type { SafeSearch } from "../types.ts";
+import { htmlEngine, isOn } from "./html.ts";
 
 const q = encodeURIComponent;
 
-/** True when a link points back into the engine itself (related searches, images, ads). */
-function isOn(url: URL, host: string): boolean {
-  return url.hostname === host || url.hostname.endsWith(`.${host}`);
+/** Each engine's word for a safe-search level. */
+function level<T extends string>(levels: Record<SafeSearch, T>): (safeSearch: SafeSearch) => T {
+  return (safeSearch) => levels[safeSearch];
 }
+
+const bingSafeSearch = level({ strict: "strict", moderate: "moderate", off: "off" });
 
 export const bing = htmlEngine({
   name: "bing",
   weight: 1,
-  url: (query) => `https://www.bing.com/search?q=${q(query)}`,
+  safeSearch: "supported",
+  url: (query, options) =>
+    `https://www.bing.com/search?q=${q(query)}&adlt=${bingSafeSearch(options.safeSearch)}`,
   selectors: { result: "li.b_algo", link: "h2 a", title: "h2", snippet: "p" },
   blockedBy: /captcha|\/challenge\b/i,
   unwrap(url) {
@@ -25,11 +31,16 @@ export const bing = htmlEngine({
   },
 });
 
+/** DuckDuckGo's documented `kp` values (also `p` on its JSON endpoints). */
+export const duckduckgoSafeSearch = level({ strict: "1", moderate: "-1", off: "-2" });
+
 /** DuckDuckGo's no-JavaScript "lite" page, the one it blocks least; its results are Bing's. */
 export const duckduckgo = htmlEngine({
   name: "duckduckgo",
   weight: 1,
-  url: (query) => `https://lite.duckduckgo.com/lite/?q=${q(query)}`,
+  safeSearch: "supported",
+  url: (query, options) =>
+    `https://lite.duckduckgo.com/lite/?q=${q(query)}&kp=${duckduckgoSafeSearch(options.safeSearch)}`,
   selectors: {
     result: "a.result-link",
     link: "a.result-link",
@@ -45,10 +56,15 @@ export const duckduckgo = htmlEngine({
   },
 });
 
+const braveSafeSearch = level({ strict: "strict", moderate: "moderate", off: "off" });
+
 export const brave = htmlEngine({
   name: "brave",
   weight: 1,
+  safeSearch: "supported",
   url: (query) => `https://search.brave.com/search?q=${q(query)}&source=web`,
+  // Brave reads the setting from a cookie only.
+  init: (options) => ({ headers: { cookie: `safesearch=${braveSafeSearch(options.safeSearch)}` } }),
   selectors: {
     result: 'div[data-type="web"]',
     link: ".result-content > a",
@@ -59,11 +75,15 @@ export const brave = htmlEngine({
   unwrap: (url) => (isOn(url, "brave.com") ? undefined : url.href),
 });
 
+const startpageSafeSearch = level({ strict: "heavy", moderate: "moderate", off: "none" });
+
 /** Startpage serves Google's results. */
 export const startpage = htmlEngine({
   name: "startpage",
   weight: 1,
-  url: (query) => `https://www.startpage.com/sp/search?query=${q(query)}`,
+  safeSearch: "supported",
+  url: (query, options) =>
+    `https://www.startpage.com/sp/search?query=${q(query)}&qadf=${startpageSafeSearch(options.safeSearch)}`,
   selectors: {
     result: "div.result",
     link: "a.result-title",
@@ -74,10 +94,14 @@ export const startpage = htmlEngine({
   unwrap: (url) => (isOn(url, "startpage.com") ? undefined : url.href),
 });
 
-/** Yandex's site-search widget endpoint, which answers without a captcha more often. */
+/**
+ * Yandex's site-search widget endpoint, which answers without a captcha more often. It has no
+ * safe-search setting, so "strict" leaves it out.
+ */
 export const yandex = htmlEngine({
   name: "yandex",
   weight: 0.7,
+  safeSearch: "unsupported",
   url: (query) => {
     const searchId = 1_000_000 + Math.floor(Math.random() * 9_000_000);
     return `https://yandex.com/search/site/?text=${q(query)}&web=1&searchid=${searchId}`;

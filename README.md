@@ -1,10 +1,11 @@
 # websearch
 
-Web search and page fetching for AI agents, with no API key, no Python and no browser.
+Web, news and image search and page fetching for AI agents, with no API key, no Python and no
+browser.
 
-`search` asks several search engines at once and merges their results into one ranked list.
-`fetchPage` turns a page into markdown that an agent can grep, instead of a summary someone else
-wrote. Everything runs in-process on Bun's `fetch` and `HTMLRewriter`, and the package has no
+`search` asks several search engines at once and merges their results into one ranked list;
+`searchNews` and `searchImages` do the same for news and images. `fetchPage` turns a page into
+markdown that an agent can grep, instead of a summary someone else wrote. Everything runs in-process on Bun's `fetch` and `HTMLRewriter`, and the package has no
 dependencies.
 
 ```ts
@@ -18,6 +19,9 @@ const page = await fetchPage(results[0].url);
 
 - [Requirements](#requirements)
 - [Searching](#searching)
+- [Safe search](#safe-search)
+- [News](#news)
+- [Images](#images)
 - [Engines](#engines)
 - [Fetching pages](#fetching-pages)
 - [How it works](#how-it-works)
@@ -86,45 +90,134 @@ results:
 | `timeout` | No answer within `timeoutMs`.                                                 |
 | `error`   | A network error, an unexpected status, or an answer the parser couldn't read. |
 | `cooling` | Blocked recently, so not asked this time (see [How it works](#how-it-works)). |
+| `skipped` | Not asked: it has no safe search, and `safeSearch` is `"strict"`.             |
 
 ### Options
 
-| Option      | Default            | What it does                                                             |
-| ----------- | ------------------ | ------------------------------------------------------------------------ |
-| `engines`   | `defaultEngines`   | The engines to ask.                                                      |
-| `limit`     | `10`               | At most this many results, and per engine.                               |
-| `language`  | `"en"`             | A language code, sent as `Accept-Language` and to engines that take one. |
-| `timeoutMs` | `6000`             | How long each engine gets.                                               |
-| `signal`    |                    | Aborts the search; `search` then rejects.                                |
-| `fetch`     | `globalThis.fetch` | The fetch to use, for tests or a proxy.                                  |
-| `userAgent` | a desktop Chrome   | Sent to the scraped engines.                                             |
-| `cooldown`  | a shared one       | Where blocks are remembered; `false` asks every engine regardless.       |
+| Option       | Default            | What it does                                                             |
+| ------------ | ------------------ | ------------------------------------------------------------------------ |
+| `engines`    | `webEngines`       | The engines to ask.                                                      |
+| `limit`      | `10`               | At most this many results, and per engine.                               |
+| `language`   | `"en"`             | A language code, sent as `Accept-Language` and to engines that take one. |
+| `safeSearch` | `"moderate"`       | `"strict"`, `"moderate"` or `"off"`; see [Safe search](#safe-search).    |
+| `timeoutMs`  | `6000`             | How long each engine gets.                                               |
+| `signal`     |                    | Aborts the search; `search` then rejects.                                |
+| `fetch`      | `globalThis.fetch` | The fetch to use, for tests or a proxy.                                  |
+| `userAgent`  | a desktop Chrome   | Sent to the scraped engines.                                             |
+| `cooldown`   | a shared one       | Where blocks are remembered; `false` asks every engine regardless.       |
 
 Bun's `fetch` honours `HTTPS_PROXY` and `HTTP_PROXY`, so a proxy can also be set from the
 environment.
 
+## Safe search
+
+```ts
+await search("query", { safeSearch: "strict" });
+```
+
+`safeSearch` is passed to every engine in that engine's own terms (`adlt=strict` for Bing,
+`kp=1` for DuckDuckGo, a cookie for Brave, `qadf=heavy` for Startpage, …):
+
+| Level        | What the engines do                                                    |
+| ------------ | ---------------------------------------------------------------------- |
+| `"strict"`   | Filter adult content out. Engines that can't filter are left out.      |
+| `"moderate"` | Filter explicit images and video, but not text. Each engine's default. |
+| `"off"`      | Filter nothing.                                                        |
+
+Each engine says what it can do in its `safeSearch` field. Yandex's site search and Mwmbl have
+no setting (`"unsupported"`), so a strict search doesn't ask them and reports them as `skipped`.
+Wikipedia has nothing to filter (`"not-needed"`). DuckDuckGo's image search knows only on and
+off, so `"moderate"` is on there.
+
+For one adult-leaning query, `"off"` returned 8 to 17 adult sites per engine. `"strict"` returned
+none: Bing gave no results at all, Brave and Startpage two or three harmless ones.
+
+## News
+
+```ts
+const { results } = await searchNews("rust programming language", { since: "week" });
+```
+
+```ts
+[
+  {
+    url: "https://www.thefastmode.com/technology-solutions/51064-red-hat-ferrous-systems-bring-safety-qualified-rust-toolchain-to-in-vehicle-operating-systems",
+    title:
+      "Red Hat, Ferrous Systems Bring Safety-Qualified Rust Toolchain to In-Vehicle Operating Systems",
+    snippet:
+      "Red Hat, the world’s leading provider of open source solutions, and Ferrous Systems, …",
+    published: "2026-10-18T22:54:36.876Z",
+    source: "The Fast Mode",
+    image:
+      "https://www.bing.com/th?id=ONUT.5930jLq58YmHOZlGHRs7rA&pid=News&w=234&h=132&c=14&rs=2&qlt=90",
+    engines: ["bing-news"],
+    score: 1,
+  },
+  // …
+];
+```
+
+`published` is an ISO date. Bing writes ages ("5h", "4mon"), which are turned into dates; they
+are as exact as the age. `since` is `"hour"`, `"day"`, `"week"` or `"month"`. DuckDuckGo has
+no hour, so it is given a day.
+
+## Images
+
+```ts
+const { results } = await searchImages("rust logo", { size: "large" });
+```
+
+```ts
+[
+  {
+    url: "https://1000logos.net/rust-logo/", // the page the image is on
+    image: "https://1000logos.net/wp-content/uploads/2025/03/Rust-Logo.png",
+    title: "Rust Logo and symbol, meaning, history, PNG, brand",
+    snippet: "",
+    thumbnail: "https://ts3.mm.bing.net/th?id=OIP.EN_yW6klxOfFYppCn4vPqQHaEK&pid=15.1",
+    width: 3840,
+    height: 2160,
+    source: "1000logos.net",
+    engines: ["bing-images"],
+    score: 1,
+  },
+  // …
+];
+```
+
+Two results are the same when their image URLs match, so the same file on two pages is listed
+once. `size` is `"small"`, `"medium"`, `"large"` or `"wallpaper"`.
+
 ## Engines
 
-`defaultEngines` are the engines that need no key:
+Every engine below needs no key. `webEngines`, `newsEngines` and `imageEngines` are the lists
+the three searches use.
 
-| Engine       | Source                               | Weight | Notes                                            |
-| ------------ | ------------------------------------ | ------ | ------------------------------------------------ |
-| `bing`       | bing.com results page                | 1      | Result links are unwrapped from Bing's redirect. |
-| `duckduckgo` | DuckDuckGo's no-JavaScript lite page | 1      | Bing's index. Blocks quickly under load.         |
-| `brave`      | search.brave.com results page        | 1      | Brave's own index.                               |
-| `startpage`  | startpage.com results page           | 1      | Google's results.                                |
-| `yandex`     | Yandex's site-search endpoint        | 0.7    | Yandex's index.                                  |
-| `wikipedia`  | The MediaWiki search API             | 0.5    | At most 3 articles.                              |
-| `mwmbl`      | The [Mwmbl](https://mwmbl.org) API   | 0.5    | A small open index run by volunteers.            |
+| Engine              | Source                               | Weight | Safe search | Notes                                    |
+| ------------------- | ------------------------------------ | ------ | ----------- | ---------------------------------------- |
+| `bing`              | bing.com results page                | 1      | yes         | Links unwrapped from Bing's redirect.    |
+| `duckduckgo`        | DuckDuckGo's no-JavaScript lite page | 1      | yes         | Bing's index. Blocks quickly under load. |
+| `brave`             | search.brave.com results page        | 1      | yes         | Brave's own index.                       |
+| `startpage`         | startpage.com results page           | 1      | yes         | Google's results.                        |
+| `yandex`            | Yandex's site-search endpoint        | 0.7    | no          | Yandex's index.                          |
+| `wikipedia`         | The MediaWiki search API             | 0.5    | not needed  | At most 3 articles.                      |
+| `mwmbl`             | The [Mwmbl](https://mwmbl.org) API   | 0.5    | no          | A small open index run by volunteers.    |
+| `bing-news`         | Bing news' results fragment          | 1      | yes         | Ages turned into dates.                  |
+| `duckduckgo-news`   | DuckDuckGo's `news.js`               | 1      | yes         | Needs a token: two requests.             |
+| `bing-images`       | Bing images' results fragment        | 1      | yes         |                                          |
+| `duckduckgo-images` | DuckDuckGo's `i.js`                  | 1      | on/off      | Needs a token: two requests.             |
+
+DuckDuckGo's JSON endpoints want a token (`vqd`) issued for each query, which its search page
+carries. Those two engines read that page first, so each of their searches is two requests.
 
 Two more take an instance or a key, so they are added by hand:
 
 ```ts
-import { defaultEngines, search, searxng, tinyfish } from "@neoworks/websearch";
+import { search, searxng, tinyfish, webEngines } from "@neoworks/websearch";
 
 await search("query", {
   engines: [
-    ...defaultEngines,
+    ...webEngines,
     searxng("http://127.0.0.1:8888"), // needs `search.formats: [html, json]` in its settings
     tinyfish(process.env.TINYFISH_API_KEY), // https://docs.tinyfish.ai/search-api, free tier
   ],
@@ -267,7 +360,7 @@ with descendant and child combinators. Engines with a JSON API implement `Engine
 
 Then:
 
-1. Add it to `defaultEngines` in `src/search.ts` if it needs no key, and save a results page as
+1. Add it to `webEngines` in `src/search.ts` if it needs no key, and save a results page as
    its fixture: `bun scripts/save-fixture.ts example`.
 2. Add it to the table in `test/engines.test.ts`, with the number of results the fixture has.
 3. Run `bun scripts/live-check.ts example` to see it answer for real.
@@ -289,7 +382,7 @@ connections. To check from a residential IP, set one of these repository secrets
 When the check fails:
 
 - **`blocked`**: the engine refuses us. If it keeps happening from a residential IP, consider
-  dropping the engine from `defaultEngines`, or lowering its weight.
+  dropping the engine from `webEngines`, or lowering its weight.
 - **`empty`, or too few results**: the page layout changed. Save a fresh page with
   `bun scripts/save-fixture.ts <engine>` and adjust the selectors until `bun test` passes again.
   Then commit the fixture and the fix together.

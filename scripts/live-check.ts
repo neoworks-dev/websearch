@@ -2,21 +2,30 @@
 // tests read saved pages, so they can't tell when an engine starts blocking us or changes its
 // layout; this can. It runs daily in CI (.github/workflows/websearch-live.yml) and by hand:
 //
-//   bun scripts/live-check.ts                 every default engine, and a page fetch
-//   bun scripts/live-check.ts bing brave      only these
+//   bun scripts/live-check.ts                     every engine (web, news, images) and a page fetch
+//   bun scripts/live-check.ts bing bing-news      only these
 //
 // Exit code 1 when anything failed. In GitHub Actions the table also goes to the job summary.
 import { appendFile } from "node:fs/promises";
 import {
-  defaultEngines,
   fetchPage,
   FetchPageError,
+  imageEngines,
+  newsEngines,
   queryEngine,
+  webEngines,
+  type Engine,
   type EngineReport,
+  type Hit,
 } from "../src/index.ts";
 
-/** A question every engine has results for, and will have for years. */
-const QUERY = "typescript programming language";
+/** Questions each kind of engine has results for, and will have for years. */
+const CHECKS: { engines: readonly Engine<Hit>[]; query: string }[] = [
+  { engines: webEngines, query: "typescript programming language" },
+  // There is news about technology every day.
+  { engines: newsEngines, query: "technology" },
+  { engines: imageEngines, query: "typescript logo" },
+];
 
 /** Fewer results than this is a failure too: a half-broken parser still finds one or two. */
 const MIN_RESULTS: Record<string, number> = { wikipedia: 1 };
@@ -86,12 +95,16 @@ function table(rows: Row[]): string {
 }
 
 const wanted = process.argv.slice(2);
-const engines = wanted.length
-  ? defaultEngines.filter((engine) => wanted.includes(engine.name))
-  : defaultEngines;
+const asks = CHECKS.flatMap(({ engines, query }) =>
+  engines
+    .filter((engine) => wanted.length === 0 || wanted.includes(engine.name))
+    .map((engine) => ({ engine, query })),
+);
 
 const reports = await Promise.all(
-  engines.map(async (engine) => (await queryEngine(engine, QUERY, { timeoutMs: 15_000 })).report),
+  asks.map(
+    async ({ engine, query }) => (await queryEngine(engine, query, { timeoutMs: 15_000 })).report,
+  ),
 );
 const rows = reports.map(engineRow);
 // Naming engines checks only those; the page fetch is checked when everything is.
@@ -101,7 +114,7 @@ const failed = rows.filter((row) => !row.ok);
 const summary = [
   `### websearch live check: ${failed.length === 0 ? "all good" : `${failed.length} failed`}`,
   "",
-  `Query: \`${QUERY}\``,
+  `Queries: ${CHECKS.map(({ query }) => `\`${query}\``).join(", ")}`,
   "",
   table(rows),
   "",

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   Cooldown,
+  EngineBlockedError,
+  searchImages,
+  type ImageHit,
+  type NewsHit,
   mergeHits,
   normalizeUrl,
   search,
@@ -11,10 +15,11 @@ import {
 import { rejection } from "./support.ts";
 
 /** An engine whose "page" is the hits as JSON, served by `fakeFetch`. */
-function engine(name: string, weight = 1): Engine {
+function engine(name: string, weight = 1, safeSearch: Engine["safeSearch"] = "supported"): Engine {
   return {
     name,
     weight,
+    safeSearch,
     request: (query) => ({ url: `https://${name}.example/?q=${encodeURIComponent(query)}` }),
     parse: (response) => parseHits(response.body),
     blocked: (response) => response.body.includes("captcha"),
@@ -39,7 +44,9 @@ function fakeFetch(answers: Record<string, Answer>): Fetch {
     if (typeof answer === "number") return Promise.resolve(new Response("", { status: answer }));
     if (Array.isArray(answer)) return Promise.resolve(new Response(JSON.stringify(answer)));
     if ("page" in answer) return Promise.resolve(new Response(answer.page));
+    // Like a real fetch: an aborted signal rejects, at once if it already is.
     return new Promise((_resolve, reject) => {
+      if (init?.signal?.aborted) reject(init.signal.reason);
       init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
     });
   };
@@ -181,5 +188,110 @@ describe("search", () => {
 
   test("an empty query is refused", async () => {
     expect((await rejection(search("  "))).message).toContain("empty");
+  });
+});
+
+describe("safe search", () => {
+  test("strict leaves out engines that can't filter, and says why", async () => {
+    const response = await search("q", {
+      engines: [
+        engine("filters"),
+        engine("no-filter", 1, "unsupported"),
+        engine("wiki", 1, "not-needed"),
+      ],
+      fetch: fakeFetch({ filters: [hit("https://a.example")], wiki: [hit("https://w.example")] }),
+      safeSearch: "strict",
+      cooldown: false,
+    });
+    expect(response.engines.map(({ engine, status, detail }) => [engine, status, detail])).toEqual([
+      ["filters", "ok", undefined],
+      ["no-filter", "skipped", "has no safe search"],
+      ["wiki", "ok", undefined],
+    ]);
+  });
+
+  test("moderate and off ask every engine", async () => {
+    const response = await search("q", {
+      engines: [engine("no-filter", 1, "unsupported")],
+      fetch: fakeFetch({ "no-filter": [hit("https://a.example")] }),
+      safeSearch: "off",
+      cooldown: false,
+    });
+    expect(response.engines[0]?.status).toBe("ok");
+  });
+});
+
+describe("engines that read a page first", () => {
+  /** Asks for a token page, then the results, both through the search's fetch. */
+  const tokenEngine: Engine = {
+    name: "token",
+    weight: 1,
+    safeSearch: "supported",
+    async request(query, options) {
+      const page = await options.get("https://token.example/");
+      if (page.body.includes("challenge")) throw new EngineBlockedError("token page blocked");
+      return { url: `https://results.example/?q=${query}&token=${page.body}` };
+    },
+    parse: (response) => parseHits(response.body),
+  };
+
+  test("the page comes through the same fetch, and the token reaches the request", async () => {
+    const asked: string[] = [];
+    const fetch: Fetch = (url) => {
+      asked.push(url);
+      const body = url.startsWith("https://token")
+        ? "t1"
+        : JSON.stringify([hit("https://a.example")]);
+      return Promise.resolve(new Response(body));
+    };
+    const response = await search("q", { engines: [tokenEngine], fetch, cooldown: false });
+    expect(asked).toEqual(["https://token.example/", "https://results.example/?q=q&token=t1"]);
+    expect(response.results).toHaveLength(1);
+  });
+
+  test("a blocked page before the request makes the engine blocked", async () => {
+    const fetch: Fetch = () => Promise.resolve(new Response("a challenge"));
+    const response = await search("q", { engines: [tokenEngine], fetch, cooldown: false });
+    expect(response.engines[0]).toMatchObject({ status: "blocked", detail: "token page blocked" });
+  });
+});
+
+describe("merging news and images", () => {
+  test("a value the first engine lacked comes from the next one", () => {
+    const dated: NewsHit = {
+      ...hit("https://news.example/1", "Story, again"),
+      published: "2026-10-19",
+    };
+    const [merged] = mergeHits(
+      [
+        { engine: engine("a"), hits: [hit("https://news.example/1", "Story")] },
+        { engine: engine("b"), hits: [dated] },
+      ],
+      10,
+    );
+    expect(merged).toMatchObject({ title: "Story", published: "2026-10-19", engines: ["a", "b"] });
+  });
+
+  test("searchImages: the same image on two pages is one result", async () => {
+    const onPage = (page: string): ImageHit => ({
+      url: page,
+      title: page,
+      snippet: "",
+      image: "https://cdn.example/logo.png",
+    });
+    const imageEngine = (name: string, page: string): Engine<ImageHit> => ({
+      name,
+      weight: 1,
+      safeSearch: "supported",
+      request: () => ({ url: `https://${name}.example/` }),
+      parse: () => [onPage(page)],
+    });
+    const response = await searchImages("logo", {
+      engines: [imageEngine("a", "https://one.example"), imageEngine("b", "https://two.example")],
+      fetch: () => Promise.resolve(new Response("")),
+      cooldown: false,
+    });
+    expect(response.results).toHaveLength(1);
+    expect(response.results[0]?.engines).toEqual(["a", "b"]);
   });
 });

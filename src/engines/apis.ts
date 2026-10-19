@@ -1,34 +1,14 @@
 // The engines with a JSON API: Wikipedia and Mwmbl without a key, SearXNG and TinyFish when the
 // caller has an instance or a key.
 import { plainText } from "../entities.ts";
-import type { Engine, Hit } from "../types.ts";
+import type { Engine, Hit, SafeSearch } from "../types.ts";
 import { languageCode } from "./html.ts";
+import { list, record, stripTags, text } from "./json.ts";
 
 const q = encodeURIComponent;
 
 /** Wikipedia asks API clients to name themselves; there is no contact in it on purpose. */
 const API_USER_AGENT = "neoworks-websearch/0.1";
-
-// Readers for JSON of unknown shape: a field that isn't what it should be reads as empty.
-
-function record(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null) return {};
-  return value as Record<string, unknown>;
-}
-
-function list(value: unknown): unknown[] {
-  if (!Array.isArray(value)) return [];
-  return value;
-}
-
-function text(value: unknown): string {
-  if (typeof value !== "string") return "";
-  return value;
-}
-
-function stripTags(html: string): string {
-  return plainText(html.replace(/<[^>]*>/g, ""));
-}
 
 /** Hits from a JSON array of results, given how to read one. */
 function hits(items: unknown[], read: (item: Record<string, unknown>) => Hit): Hit[] {
@@ -41,6 +21,7 @@ function hits(items: unknown[], read: (item: Record<string, unknown>) => Hit): H
 export const wikipedia: Engine = {
   name: "wikipedia",
   weight: 0.5,
+  safeSearch: "not-needed",
   request: (query, options) => ({
     url:
       `https://${languageCode(options.language)}.wikipedia.org/w/api.php?action=query` +
@@ -63,6 +44,8 @@ export const wikipedia: Engine = {
 export const mwmbl: Engine = {
   name: "mwmbl",
   weight: 0.5,
+  // A crawl of the open web with no filter: left out under "strict".
+  safeSearch: "unsupported",
   request: (query) => ({
     url: `https://api.mwmbl.org/api/v1/search/?s=${q(query)}`,
     init: { headers: { accept: "application/json", "user-agent": API_USER_AGENT } },
@@ -83,14 +66,20 @@ export const mwmbl: Engine = {
   },
 };
 
+const SEARXNG_SAFE_SEARCH: Record<SafeSearch, number> = { strict: 2, moderate: 1, off: 0 };
+
 /** A SearXNG instance with the JSON format enabled (`search.formats: [html, json]`). */
 export function searxng(baseUrl: string, options: { name?: string; weight?: number } = {}): Engine {
   const base = baseUrl.replace(/\/+$/, "");
   return {
     name: options.name ?? "searxng",
     weight: options.weight ?? 1.5,
+    safeSearch: "supported",
     request: (query, requestOptions) => ({
-      url: `${base}/search?q=${q(query)}&format=json&language=${languageCode(requestOptions.language)}`,
+      url:
+        `${base}/search?q=${q(query)}&format=json` +
+        `&language=${languageCode(requestOptions.language)}` +
+        `&safesearch=${SEARXNG_SAFE_SEARCH[requestOptions.safeSearch]}`,
       init: { headers: { accept: "application/json" } },
     }),
     parse: (response) =>
@@ -108,6 +97,8 @@ export function tinyfish(apiKey: string, options: { weight?: number } = {}): Eng
   return {
     name: "tinyfish",
     weight: options.weight ?? 1,
+    // Its API documents no such setting.
+    safeSearch: "unsupported",
     request: (query, requestOptions) => ({
       url: `https://api.search.tinyfish.ai?query=${q(query)}&language=${languageCode(requestOptions.language)}`,
       init: { headers: { accept: "application/json", "x-api-key": apiKey } },
