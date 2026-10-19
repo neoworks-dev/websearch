@@ -4,10 +4,7 @@
 // between (rebinding) is not caught.
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-
-export class PrivateAddressError extends Error {
-  override name = "PrivateAddressError";
-}
+import { FetchPageError } from "./errors.ts";
 
 /** [first address, prefix length] of the IPv4 ranges that are not the public internet. */
 const PRIVATE_V4: [number, number][] = [
@@ -77,18 +74,33 @@ export function isPublicAddress(address: string): boolean {
   return true;
 }
 
-/** Throws unless `url` is http(s) and its host resolves to public addresses only. */
+/**
+ * Throws a `FetchPageError` unless `url` is http(s) and its host resolves to public addresses
+ * only: "unsupported-url", "private-address", or "unreachable" when the name doesn't resolve.
+ */
 export async function assertPublicUrl(url: URL): Promise<void> {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new PrivateAddressError(`Only http and https pages are fetched, not ${url.protocol}`);
+    throw new FetchPageError(
+      "unsupported-url",
+      `Only http and https pages are fetched, not ${url.protocol}`,
+    );
   }
-  const host = url.hostname.replace(/^\[|\]$/g, "");
-  const addresses = isIP(host)
-    ? [host]
-    : (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address);
-  for (const address of addresses) {
+  for (const address of await addressesOf(url.hostname)) {
     if (!isPublicAddress(address)) {
-      throw new PrivateAddressError(`${url.hostname} is on a private network (${address})`);
+      throw new FetchPageError(
+        "private-address",
+        `${url.hostname} is on a private network (${address})`,
+      );
     }
+  }
+}
+
+async function addressesOf(hostname: string): Promise<string[]> {
+  const host = hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host)) return [host];
+  try {
+    return (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address);
+  } catch (error) {
+    throw new FetchPageError("unreachable", `${hostname} doesn't resolve`, { cause: error });
   }
 }

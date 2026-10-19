@@ -1,9 +1,17 @@
-// Fetches one page and returns it as markdown (HTML) or as it is (text, JSON, XML). Redirects are
-// followed by hand so that every hop passes the private-network guard; the body is read up to a
-// size limit; the charset comes from the header, else from the page's <meta>.
+// Fetches one page and returns it as markdown (HTML) or as it is (text, JSON, XML).
+//
+// Two kinds of failure are told apart:
+//   - No page at all: `fetchPage` throws a `FetchPageError` with a `code` (errors.ts).
+//   - A page that can't be read as it is (a block, a shell that needs JavaScript, a 404): it is
+//     returned, with a `problem` saying which, so the caller can move on to another source.
+//
+// Redirects are followed by hand so that every hop passes the private-network guard; the body
+// is read up to a size limit; the charset comes from the header, else from the page's <meta>.
+import { BLOCK_STATUSES, blockedBy } from "./blocks.ts";
+import { FetchPageError } from "./errors.ts";
 import { assertPublicUrl } from "./guard.ts";
-import { htmlToMarkdown } from "./markdown.ts";
 import { DEFAULT_USER_AGENT, type Fetch } from "./http.ts";
+import { htmlToMarkdown, type Markdown } from "./markdown.ts";
 
 export interface FetchPageOptions {
   fetch?: Fetch;
@@ -35,43 +43,140 @@ export interface Page {
   /** Bytes read, at most `maxBytes`. */
   bytes: number;
   truncated: boolean;
+  /** Set when the page loaded but isn't the content that was asked for. */
+  problem?: PageProblem;
 }
 
-export class FetchPageError extends Error {
-  override name = "FetchPageError";
+export interface PageProblem {
+  /**
+   * - `blocked`: bot protection answered instead of the site (`detail` names it);
+   * - `needs-javascript`: the HTML is a shell that scripts fill in;
+   * - `http-error`: the site answered with an error status (404, 500, …).
+   */
+  kind: "blocked" | "needs-javascript" | "http-error";
+  /** What was seen, for a person or an agent: "a Cloudflare challenge (HTTP 403)", "HTTP 404". */
+  detail: string;
 }
 
 const TEXT_TYPES = /^(text\/|application\/(json|xml|javascript|ld\+json)|[^;]*\+(json|xml))/;
 
-/** Fetches `url` and converts it. Throws for non-text content and private addresses. */
+/** A page with fewer words than this has almost no text of its own. */
+const THIN_WORDS = 50;
+
+/**
+ * Block pages are short: the ones seen were 1 to 6 words. A longer page that mentions a captcha
+ * has one on its comment form (a 145-word news item did). Under an error status, a page of up
+ * to this many words with a protection's marks is that protection's block page.
+ */
+const BLOCK_PAGE_WORDS = 300;
+
+/**
+ * Fetches `url` and converts it. Throws a `FetchPageError` when there is no page (see its
+ * `code`); returns a page with a `problem` when there is one that can't be read as it is.
+ */
 export async function fetchPage(url: string, options: FetchPageOptions = {}): Promise<Page> {
-  const timeout = AbortSignal.timeout(options.timeoutMs ?? 20_000);
-  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  const { response, finalUrl } = await follow(new URL(url), options, signal);
+  const { response, finalUrl, bytes, truncated } = await download(url, options);
 
   const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
   const mime = contentType.split(";")[0]?.trim() ?? "";
-  const { bytes, truncated } = await readBody(response, options.maxBytes ?? 5_000_000);
   const text = decode(bytes, contentType);
-  const html =
+  const isHtml =
     mime === "text/html" ||
     mime === "application/xhtml+xml" ||
     (mime === "" && /^\s*(<!doctype html|<html)/i.test(text));
-  if (!html && !TEXT_TYPES.test(mime)) {
-    throw new FetchPageError(`${finalUrl} is ${mime || "of an unknown type"}, not a text page`);
+  if (!isHtml && !TEXT_TYPES.test(mime)) {
+    throw new FetchPageError(
+      "not-text",
+      `${finalUrl} is ${mime || "of an unknown type"}, not text`,
+    );
   }
 
-  const page = {
+  const page: Page = {
     url,
     finalUrl,
     status: response.status,
     contentType,
+    content: text,
     bytes: bytes.length,
     truncated,
   };
-  if (!html) return { ...page, content: text };
-  const { markdown, ...meta } = htmlToMarkdown(text, finalUrl);
-  return { ...page, ...meta, content: markdown };
+  if (isHtml) {
+    const { markdown, title, description } = convert(text, finalUrl);
+    page.content = markdown;
+    if (title !== undefined) page.title = title;
+    if (description !== undefined) page.description = description;
+  }
+  const problem = diagnose(page.status, isHtml ? text : undefined, page.content);
+  if (problem) page.problem = problem;
+  return page;
+}
+
+/** The response and its body, or a `FetchPageError` saying why there is none. */
+async function download(
+  url: string,
+  options: FetchPageOptions,
+): Promise<{ response: Response; finalUrl: string; bytes: Uint8Array; truncated: boolean }> {
+  let start: URL;
+  try {
+    start = new URL(url);
+  } catch {
+    throw new FetchPageError("unsupported-url", `${url} isn't a URL`);
+  }
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+  try {
+    const { response, finalUrl } = await follow(start, options, signal);
+    const body = await readBody(response, options.maxBytes ?? 5_000_000);
+    return { response, finalUrl, ...body };
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    if (error instanceof FetchPageError) throw error;
+    if (timeout.aborted) {
+      throw new FetchPageError("timeout", `${start.host} didn't answer within ${timeoutMs} ms`, {
+        cause: error,
+      });
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new FetchPageError("unreachable", `${start.host}: ${reason}`, { cause: error });
+  }
+}
+
+/** The page as markdown; its <noscript> content when that is where the text is. */
+function convert(html: string, url: string): Markdown {
+  const converted = htmlToMarkdown(html, url);
+  if (words(converted.markdown) >= THIN_WORDS || !/<noscript\b/i.test(html)) return converted;
+  // Some sites put their content in <noscript> for clients without JavaScript; Discourse
+  // forums do. Without its tags, the content is parsed as part of the page.
+  const unwrapped = htmlToMarkdown(html.replace(/<\/?noscript\b[^>]*>/gi, ""), url);
+  return words(unwrapped.markdown) > words(converted.markdown) ? unwrapped : converted;
+}
+
+/** What is wrong with a page that loaded, if anything. `html` is undefined for other text. */
+function diagnose(
+  status: number,
+  html: string | undefined,
+  content: string,
+): PageProblem | undefined {
+  const count = words(content);
+  const protection = html === undefined ? undefined : blockedBy(html);
+  if (status >= 400) {
+    if (protection && (BLOCK_STATUSES.has(status) || count < BLOCK_PAGE_WORDS)) {
+      return { kind: "blocked", detail: `${protection} (HTTP ${status})` };
+    }
+    if (status === 429) return { kind: "blocked", detail: "rate limited (HTTP 429)" };
+    return { kind: "http-error", detail: `HTTP ${status}` };
+  }
+  // With a 200, only a page with next to no text of its own is a block page.
+  if (protection && count < THIN_WORDS) return { kind: "blocked", detail: protection };
+  if (html !== undefined && count < THIN_WORDS && /<script\b/i.test(html)) {
+    return { kind: "needs-javascript", detail: `${count} words of text without JavaScript` };
+  }
+  return undefined;
+}
+
+function words(text: string): number {
+  return text.split(/\s+/).filter((word) => word !== "").length;
 }
 
 /** The response after redirects, and where they ended. */
@@ -98,7 +203,9 @@ async function follow(
       return { response, finalUrl: current.href };
     }
     await response.body?.cancel();
-    if (hop >= maxRedirects) throw new FetchPageError(`More than ${maxRedirects} redirects`);
+    if (hop >= maxRedirects) {
+      throw new FetchPageError("too-many-redirects", `More than ${maxRedirects} redirects`);
+    }
     current = new URL(location, current);
   }
 }

@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { fetchPage, isPublicAddress, type Fetch } from "../src/index.ts";
+import {
+  fetchPage,
+  FetchPageError,
+  isPublicAddress,
+  type Fetch,
+  type FetchPageErrorCode,
+} from "../src/index.ts";
 import { rejection } from "./support.ts";
 
 describe("isPublicAddress", () => {
@@ -48,6 +54,13 @@ function site(pages: Record<string, string | Response>): Fetch & { asked: string
   return Object.assign(fake, { asked });
 }
 
+/** The code of the `FetchPageError` that `promise` rejects with; fails on any other error. */
+async function failure(promise: Promise<unknown>): Promise<FetchPageErrorCode> {
+  const error = await rejection(promise);
+  if (!(error instanceof FetchPageError)) throw error;
+  return error.code;
+}
+
 function redirect(to: string): Response {
   return new Response(null, { status: 302, headers: { location: to } });
 }
@@ -72,19 +85,14 @@ describe("fetchPage", () => {
       "http://[::1]/",
       "http://169.254.169.254/latest/meta-data",
     ]) {
-      expect((await rejection(fetchPage(url, { fetch }))).message).toContain("private network");
+      expect(await failure(fetchPage(url, { fetch }))).toBe("private-address");
     }
-    expect((await rejection(fetchPage("file:///etc/passwd", { fetch }))).message).toContain(
-      "http and https",
-    );
     expect(fetch.asked).toEqual([]);
   });
 
   test("a redirect into the private network is refused", async () => {
     const fetch = site({ "https://1.1.1.1/": redirect("http://192.168.0.1/admin") });
-    expect((await rejection(fetchPage("https://1.1.1.1/", { fetch }))).message).toContain(
-      "private network",
-    );
+    expect(await failure(fetchPage("https://1.1.1.1/", { fetch }))).toBe("private-address");
     expect(fetch.asked).toEqual(["https://1.1.1.1/"]);
   });
 
@@ -101,24 +109,13 @@ describe("fetchPage", () => {
     });
   });
 
-  test("too many redirects", async () => {
-    const fetch = site({ "https://1.1.1.1/": redirect("/") });
-    const error = await rejection(fetchPage("https://1.1.1.1/", { fetch, maxRedirects: 3 }));
-    expect(error.message).toContain("redirects");
-  });
-
-  test("text that isn't HTML comes back as it is; binary content is refused", async () => {
+  test("text that isn't HTML comes back as it is", async () => {
     const fetch = site({
       "https://1.1.1.1/data.json": new Response('{"a":1}', {
         headers: { "content-type": "application/json" },
       }),
-      "https://1.1.1.1/file.pdf": new Response("%PDF", {
-        headers: { "content-type": "application/pdf" },
-      }),
     });
     expect((await fetchPage("https://1.1.1.1/data.json", { fetch })).content).toBe('{"a":1}');
-    const error = await rejection(fetchPage("https://1.1.1.1/file.pdf", { fetch }));
-    expect(error.message).toContain("not a text page");
   });
 
   test("the body is cut at maxBytes", async () => {
@@ -145,5 +142,116 @@ describe("fetchPage", () => {
     });
     expect((await fetchPage("https://1.1.1.1/header", { fetch })).content).toBe("café");
     expect((await fetchPage("https://1.1.1.1/meta", { fetch })).content).toBe("café");
+  });
+});
+
+describe("fetchPage: no page at all", () => {
+  test.each<[string, FetchPageErrorCode, string, Fetch?]>([
+    ["not a URL", "unsupported-url", "not a url"],
+    ["not http", "unsupported-url", "file:///etc/passwd"],
+    ["a name that doesn't resolve", "unreachable", "https://does-not-exist.invalid/"],
+    [
+      "a refused connection",
+      "unreachable",
+      "https://1.1.1.1/",
+      () => Promise.reject(new TypeError("Connection refused")),
+    ],
+    [
+      "too many redirects",
+      "too-many-redirects",
+      "https://1.1.1.1/",
+      site({ "https://1.1.1.1/": redirect("/") }),
+    ],
+    [
+      "a PDF",
+      "not-text",
+      "https://1.1.1.1/file.pdf",
+      site({
+        "https://1.1.1.1/file.pdf": new Response("%PDF", {
+          headers: { "content-type": "application/pdf" },
+        }),
+      }),
+    ],
+  ])("%s: %s", async (_case, code, url, fetch = site({})) => {
+    expect(await failure(fetchPage(url, { fetch, maxRedirects: 3 }))).toBe(code);
+  });
+
+  test("no answer in time: timeout", async () => {
+    const hang: Fetch = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      });
+    expect(await failure(fetchPage("https://1.1.1.1/", { fetch: hang, timeoutMs: 20 }))).toBe(
+      "timeout",
+    );
+  });
+});
+
+describe("fetchPage: a page that can't be read as it is", () => {
+  const prose = `<p>${"Plenty of words in an ordinary paragraph of text. ".repeat(40)}</p>`;
+
+  async function problemOf(response: Response): Promise<unknown> {
+    const page = await fetchPage("https://1.1.1.1/", {
+      fetch: site({ "https://1.1.1.1/": response }),
+    });
+    return page.problem;
+  }
+
+  function html(body: string, status = 200): Response {
+    return new Response(body, { status, headers: { "content-type": "text/html" } });
+  }
+
+  test("bot protection is named", async () => {
+    expect(
+      await problemOf(html("<title>Just a moment...</title><div id=cf-chl-widget></div>", 403)),
+    ).toEqual({ kind: "blocked", detail: "a Cloudflare challenge (HTTP 403)" });
+    // Reddit's check: a 200 with a form that a script answers.
+    expect(
+      await problemOf(
+        html(
+          '<title>Reddit</title><form hidden><input type="hidden" name="solution" /></form><script>…</script>',
+        ),
+      ),
+    ).toEqual({ kind: "blocked", detail: "a JavaScript challenge" });
+    expect(await problemOf(html("Too many requests", 429))).toEqual({
+      kind: "blocked",
+      detail: "rate limited (HTTP 429)",
+    });
+  });
+
+  test("an error status that isn't a block", async () => {
+    expect(await problemOf(html("<h1>Not found</h1>", 404))).toEqual({
+      kind: "http-error",
+      detail: "HTTP 404",
+    });
+  });
+
+  test("a shell that scripts fill in", async () => {
+    expect(await problemOf(html('<div id="root"></div><script src="/app.js"></script>'))).toEqual({
+      kind: "needs-javascript",
+      detail: "0 words of text without JavaScript",
+    });
+  });
+
+  test("a short page without scripts, or an article with a captcha on its form, is fine", async () => {
+    expect(
+      await problemOf(html("<h1>Example Domain</h1><p>For use in examples.</p>")),
+    ).toBeUndefined();
+    // A short news item (technode.com) with a captcha on its comment form.
+    const article = `<h1>News</h1><p>${"A short news item. ".repeat(25)}</p>`;
+    expect(
+      await problemOf(html(`${article}<form><div class="g-recaptcha"></div></form>`)),
+    ).toBeUndefined();
+  });
+
+  test("content in <noscript> is used when the page has none outside it", async () => {
+    // How Discourse forums serve a topic to clients without JavaScript.
+    const page = await fetchPage("https://1.1.1.1/", {
+      fetch: site({
+        "https://1.1.1.1/": `<script src="/app.js"></script><noscript><h1>The topic</h1>${prose}</noscript>`,
+      }),
+    });
+    expect(page.problem).toBeUndefined();
+    expect(page.content).toStartWith("# The topic");
   });
 });

@@ -22,8 +22,10 @@ export { htmlEngine, type HtmlEngineSpec } from "./engines/html.ts";
 export { extractHits, type RawHit, type ResultSelectors } from "./extract.ts";
 
 // Fetching
-export { fetchPage, FetchPageError, type FetchPageOptions, type Page } from "./page.ts";
+export { fetchPage, type FetchPageOptions, type Page, type PageProblem } from "./page.ts";
+export { FetchPageError, type FetchPageErrorCode } from "./errors.ts";
+export { blockedBy } from "./blocks.ts";
 export { htmlToMarkdown, type Markdown } from "./markdown.ts";
-export { assertPublicUrl, isPublicAddress, PrivateAddressError } from "./guard.ts";
+export { assertPublicUrl, isPublicAddress } from "./guard.ts";
 
 export { DEFAULT_USER_AGENT, type Fetch } from "./http.ts";

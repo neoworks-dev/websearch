@@ -7,7 +7,13 @@
 //
 // Exit code 1 when anything failed. In GitHub Actions the table also goes to the job summary.
 import { appendFile } from "node:fs/promises";
-import { defaultEngines, fetchPage, queryEngine, type EngineReport } from "../src/index.ts";
+import {
+  defaultEngines,
+  fetchPage,
+  FetchPageError,
+  queryEngine,
+  type EngineReport,
+} from "../src/index.ts";
 
 /** A question every engine has results for, and will have for years. */
 const QUERY = "typescript programming language";
@@ -45,25 +51,25 @@ function engineRow(report: EngineReport): Row {
 
 async function pageRow(): Promise<Row> {
   const started = performance.now();
-  const ms = (): number => Math.round(performance.now() - started);
+  const row = (ok: boolean, status: string, results: string, detail: string): Row => ({
+    check: "fetchPage",
+    ok,
+    status,
+    results,
+    ms: Math.round(performance.now() - started),
+    detail,
+  });
   try {
     const page = await fetchPage(PAGE);
-    const ok =
-      page.status === 200 && page.content.includes("Microsoft") && page.content.length > 5000;
-    const detail = ok
-      ? `"${page.title ?? ""}"`
-      : `HTTP ${page.status}, ${page.content.length} characters`;
-    return {
-      check: "fetchPage",
-      ok,
-      status: ok ? "ok" : "wrong",
-      results: `${page.content.length} chars`,
-      ms: ms(),
-      detail,
-    };
+    const size = `${page.content.length} chars`;
+    if (page.problem) return row(false, page.problem.kind, size, page.problem.detail);
+    // The article mentions its maker; without it, the markdown lost the article.
+    if (!page.content.includes("Microsoft"))
+      return row(false, "wrong", size, "the article is missing");
+    return row(true, "ok", size, `"${page.title ?? ""}"`);
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    return { check: "fetchPage", ok: false, status: "error", results: "", ms: ms(), detail };
+    if (error instanceof FetchPageError) return row(false, error.code, "", error.message);
+    throw error;
   }
 }
 

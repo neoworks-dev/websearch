@@ -152,8 +152,39 @@ const page = await fetchPage("https://en.wikipedia.org/wiki/TypeScript");
 }
 ```
 
-HTML becomes markdown. Other text types (plain text, JSON, XML) come back unchanged, and
-anything else (PDFs, images) is refused with a `FetchPageError`.
+HTML becomes markdown. Other text types (plain text, JSON, XML) come back unchanged.
+
+`fetchPage` tells apart two ways of failing, so the caller can say what happened and try another
+source:
+
+**No page at all.** It throws a `FetchPageError` whose `code` says why:
+
+| `code`               | When                                                            |
+| -------------------- | --------------------------------------------------------------- |
+| `unsupported-url`    | Not a URL, or not `http:` / `https:`.                           |
+| `private-address`    | The host is on a private network (see below).                   |
+| `unreachable`        | The name doesn't resolve, the connection is refused, TLS fails. |
+| `timeout`            | No complete answer within `timeoutMs`.                          |
+| `too-many-redirects` | More than `maxRedirects`.                                       |
+| `not-text`           | A PDF, an image, a download.                                    |
+
+**A page that isn't the content.** It returns the page with a `problem`:
+
+| `problem.kind`     | `problem.detail`, for example                           | What it is                                   |
+| ------------------ | ------------------------------------------------------- | -------------------------------------------- |
+| `blocked`          | `"a Cloudflare challenge (HTTP 403)"`                   | Bot protection answered instead of the site. |
+| `blocked`          | `"a JavaScript challenge"`, `"rate limited (HTTP 429)"` |                                              |
+| `needs-javascript` | `"13 words of text without JavaScript"`                 | The HTML is a shell that scripts fill in.    |
+| `http-error`       | `"HTTP 404"`                                            | The site answered with an error.             |
+
+Blocks are recognized by the marks of Cloudflare, DataDome, HUMAN (PerimeterX), Akamai, AWS
+WAF, Anubis, captchas and script-answered challenge forms, on pages with next to no text of their
+own (`blockedBy` is exported). A page whose text is only inside `<noscript>`, as Discourse
+forums serve it, is read from there.
+
+How often each happens: of 38 result pages from one search, 29 were readable. Five were
+`blocked` (four Reddit threads, one Cloudflare site) and four were `needs-javascript` (YouTube,
+OpenRouter).
 
 Most pages are long and mostly not what the agent is after. The idea is to save `content` to a
 file and let the agent search it, rather than putting the whole page into its context.
@@ -273,8 +304,9 @@ To run the same check locally: `bun scripts/live-check.ts` (all engines) or
 - **Rate limits.** Engines block quickly when asked often from one address. DuckDuckGo started
   blocking after about ten queries in an afternoon. The cooldown keeps a blocked engine from
   being asked again; it can't prevent the first block.
-- **No JavaScript.** Pages that only render in a browser come back mostly empty, and engines
-  that need JavaScript (Google) or a proof-of-work captcha (Mojeek) aren't included.
+- **No JavaScript.** Pages that only render in a browser come back as `needs-javascript`, and
+  JavaScript bot checks (Reddit's) as `blocked`; neither is worked around. Engines that need
+  JavaScript (Google) or a proof-of-work captcha (Mojeek) aren't included.
 - **Text only.** PDFs and other binary documents are refused.
 
 ## Development
