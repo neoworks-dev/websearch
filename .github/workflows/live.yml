@@ -1,0 +1,52 @@
+# Asks every search engine one question a day, and fails when one of them blocks
+# us or has changed its page. The unit tests read saved pages and can't notice either; only a
+# live request can. See README.md, "When an engine breaks".
+name: websearch live check
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: websearch-live
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # GitHub's runners are in Microsoft's data centres, which search engines block far more
+      # readily than a home connection. To check from a residential IP, set one of:
+      #   WEBSEARCH_PROXY      an HTTP(S) proxy URL, http://user:password@host:port
+      #   WEBSEARCH_WIREGUARD  a WireGuard config file (its [Interface] and [Peer] sections)
+      # Without either, the check runs from the runner's own address.
+      WEBSEARCH_PROXY: ${{ secrets.WEBSEARCH_PROXY }}
+      WEBSEARCH_WIREGUARD: ${{ secrets.WEBSEARCH_WIREGUARD }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Connect the VPN
+        if: env.WEBSEARCH_WIREGUARD != ''
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q wireguard-tools openresolv
+          printf '%s\n' "$WEBSEARCH_WIREGUARD" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          sudo chmod 600 /etc/wireguard/wg0.conf
+          sudo wg-quick up wg0
+
+      - name: Ask every engine
+        run: |
+          if [ -n "$WEBSEARCH_PROXY" ]; then
+            export HTTPS_PROXY="$WEBSEARCH_PROXY" HTTP_PROXY="$WEBSEARCH_PROXY"
+          fi
+          # The network the requests leave from, to tell a residential IP from the runner's.
+          echo "Requests come from: $(curl -s --max-time 10 https://ipinfo.io/org || echo unknown)"
+          bun scripts/live-check.ts

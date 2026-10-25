@@ -7,7 +7,15 @@
     ".": "./src/index.ts"
   },
   "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "format": "prettier --check .",
     "live-check": "bun scripts/live-check.ts",
     "save-fixture": "bun scripts/save-fixture.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "prettier": "^3.9.10",
+    "typescript": "^7.0.2"
   }
 }
